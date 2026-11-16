@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Edge SMS Spam Filter</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 24px auto; padding: 0 16px; background: #f5f6fa; color: #1e272e; }
+    .card { background: #fff; border-radius: 14px; padding: 18px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); margin-bottom: 16px; }
+    h2 { margin: 0 0 6px; font-size: 1.25rem; }
+    .sub { font-size: 0.85rem; color: #57606f; margin-bottom: 14px; }
+    textarea { width: 100%; box-sizing: border-box; height: 110px; padding: 12px; border: 1px solid #dcdde1; border-radius: 10px; font-size: 1rem; resize: vertical; }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    button { flex: 1; padding: 12px; border: none; border-radius: 10px; font-weight: 600; font-size: 0.95rem; cursor: pointer; }
+    .btn-primary { background: #2f3542; color: #fff; }
+    .btn-warn { background: #ff4757; color: #fff; }
+    .btn-outline { background: #f1f2f6; color: #2f3542; font-size: 0.8rem; padding: 8px; }
+    .badge { display: inline-block; padding: 6px 12px; border-radius: 999px; font-weight: 700; font-size: 0.9rem; }
+    .spam { background: #ffe0e3; color: #c23616; }
+    .ham { background: #dff9fb; color: #009432; }
+    .meta { font-size: 0.8rem; color: #747d8c; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Local SMS Spam Filter</h2>
+    <div class="sub" id="status">Loading model into iPhone browser...</div>
+
+    <div class="row" style="margin-bottom: 10px;">
+      <button class="btn-outline" onclick="fillSample('ham')">Sample GCash Ham</button>
+      <button class="btn-outline" onclick="fillSample('spam')">Sample Phishing Spam</button>
+    </div>
+
+    <textarea id="smsInput" placeholder="Paste or type an SMS message to classify locally..."></textarea>
+
+    <div class="row">
+      <button class="btn-primary" onclick="classifySMS()">Check Locally</button>
+      <button class="btn-outline" style="flex: 0.6;" onclick="loadModel(true)">Update Model</button>
+    </div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none;">
+    <div id="verdictBadge"></div>
+    <div class="meta" id="resultMeta"></div>
+    <div class="row" style="margin-top: 14px;">
+      <button class="btn-warn" onclick="flagAsSpam()">Flag Missed Spam (Send Vector Only)</button>
+    </div>
+    <div class="meta" id="flagStatus"></div>
+  </div>
+
+  <script>
+    const SUPABASE_URL = "https://rtidtpwhjfsmpkmcrnsr.supabase.co";
+    const SUPABASE_ANON_KEY = "sb_publishable_EPaUeKs2XTa_N8L1CR5Dtg_VE6_ua8J";
+
+    // Configure single-threaded WASM for iOS Safari compatibility
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+    ort.env.wasm.numThreads = 1;
+
+    let session = null;
+    let vocabData = null;
+    let lastSparseVector = null;
+
+    async function loadModel(forceRefresh = false) {
+      const statusEl = document.getElementById("status");
+      statusEl.textContent = forceRefresh ? "Fetching updated model from cloud..." : "Downloading ONNX model...";
+      const cacheBust = `?t=${Date.now()}`;
+      try {
+        const vocabRes = await fetch(`${SUPABASE_URL}/storage/v1/object/public/models/vocab.json${cacheBust}`);
+        vocabData = await vocabRes.json();
+
+        const modelRes = await fetch(`${SUPABASE_URL}/storage/v1/object/public/models/spam_model.onnx${cacheBust}`);
+        const modelBuf = await modelRes.arrayBuffer();
+        session = await ort.InferenceSession.create(modelBuf, { executionProviders: ["wasm"] });
+
+        statusEl.textContent = `Ready (On-Device WASM • ${vocabData.num_features} features). Safe to enable Airplane Mode.`;
+      } catch (err) {
+        statusEl.textContent = "Error loading model: " + err.message;
+      }
+    }
+
+    function vectorizeSMS(rawText) {
+      let text = rawText.toLowerCase()
+        .replace(/http\S+|www\.\S+|bit\.ly\/\S+/g, " urltoken ")
+        .replace(/\b\d{4,}\b/g, " numtoken ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const tokens = text.match(/[a-z0-9_]{2,}/g) || [];
+      const ngrams = [...tokens];
+      for (let i = 0; i < tokens.length - 1; i++) {
+        ngrams.push(`${tokens[i]} ${tokens[i + 1]}`);
+      }
+
+      const tfCounts = {};
+      for (const ng of ngrams) {
+        if (Object.prototype.hasOwnProperty.call(vocabData.vocab, ng)) {
+          const idx = vocabData.vocab[ng];
+          tfCounts[idx] = (tfCounts[idx] || 0) + 1;
+        }
+      }
+
+      const dense = new Float32Array(vocabData.num_features);
+      let normSq = 0;
+      for (const [idxStr, count] of Object.entries(tfCounts)) {
+        const idx = Number(idxStr);
+        const val = count * vocabData.idf[idx];
+        dense[idx] = val;
+        normSq += val * val;
+      }
+
+      const sparse = {};
+      if (normSq > 0) {
+        const norm = Math.sqrt(normSq);
+        for (const idxStr of Object.keys(tfCounts)) {
+          const idx = Number(idxStr);
+          dense[idx] /= norm;
+          sparse[idx] = Number(dense[idx].toFixed(6));
+        }
+      }
+      return { dense, sparse };
+    }
+
+    async function classifySMS() {
+      const text = document.getElementById("smsInput").value.trim();
+      if (!text || !session || !vocabData) return;
+
+      const t0 = performance.now();
+      const { dense, sparse } = vectorizeSMS(text);
+      lastSparseVector = sparse;
+
+      const inputTensor = new ort.Tensor("float32", dense, [1, vocabData.num_features]);
+      const outputs = await session.run({ float_input: inputTensor });
+      const probs = outputs[session.outputNames[1]].data;
+      const latencyMs = (performance.now() - t0).toFixed(2);
+
+      const spamProb = probs[1];
+      const isSpam = spamProb >= 0.5;
+
+      document.getElementById("resultCard").style.display = "block";
+      document.getElementById("flagStatus").textContent = "";
+      document.getElementById("verdictBadge").innerHTML = isSpam
+        ? `<span class="badge spam">SPAM / PHISHING (${(spamProb * 100).toFixed(1)}%)</span>`
+        : `<span class="badge ham">HAM / LEGITIMATE (${((1 - spamProb) * 100).toFixed(1)}%)</span>`;
+      document.getElementById("resultMeta").textContent =
+        `Local on-device inference time: ${latencyMs} ms • Raw text stayed on device`;
+    }
+
+    async function flagAsSpam() {
+      if (!lastSparseVector || Object.keys(lastSparseVector).length === 0) {
+        document.getElementById("flagStatus").textContent = "No known vocabulary tokens found to upload.";
+        return;
+      }
+      const statusEl = document.getElementById("flagStatus");
+      statusEl.textContent = "Uploading anonymized TF-IDF vector...";
+
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/flagged_spam`, {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal"
+        },
+        body: JSON.stringify({ sparse_tfidf: lastSparseVector })
+      });
+
+      statusEl.textContent = res.ok
+        ? "Anonymized vector uploaded to Supabase (raw SMS discarded). Run Colab Cell 6 to retrain!"
+        : `Upload failed (${res.status}). Check Supabase URL/key.`;
+    }
+
+    function fillSample(type) {
+      document.getElementById("smsInput").value = type === "ham"
+        ? "Your GCash OTP is 839201. Never share this code with anyone."
+        : "ADVISORY: Your GCash account will be suspended today. Verify now at http://gcash-verify-ph.com to avoid deactivation.";
+    }
+
+    loadModel();
+  </script>
+</body>
+</html>
