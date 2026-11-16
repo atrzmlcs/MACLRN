@@ -53,9 +53,9 @@
     const SUPABASE_URL = "https://rtidtpwhjfsmpkmcrnsr.supabase.co";
     const SUPABASE_ANON_KEY = "sb_publishable_EPaUeKs2XTa_N8L1CR5Dtg_VE6_ua8J";
 
-    // Configure single-threaded WASM for iOS Safari compatibility
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
     ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
 
     let session = null;
     let vocabData = null;
@@ -67,15 +67,17 @@
       const cacheBust = `?t=${Date.now()}`;
       try {
         const vocabRes = await fetch(`${SUPABASE_URL}/storage/v1/object/public/models/vocab.json${cacheBust}`);
+        if (!vocabRes.ok) throw new Error(`vocab.json HTTP ${vocabRes.status} (check if 'models' bucket is Public)`);
         vocabData = await vocabRes.json();
 
         const modelRes = await fetch(`${SUPABASE_URL}/storage/v1/object/public/models/spam_model.onnx${cacheBust}`);
+        if (!modelRes.ok) throw new Error(`spam_model.onnx HTTP ${modelRes.status} (run Colab Cell 5 first)`);
         const modelBuf = await modelRes.arrayBuffer();
-        session = await ort.InferenceSession.create(modelBuf, { executionProviders: ["wasm"] });
 
+        session = await ort.InferenceSession.create(modelBuf, { executionProviders: ["wasm"] });
         statusEl.textContent = `Ready (On-Device WASM • ${vocabData.num_features} features). Safe to enable Airplane Mode.`;
       } catch (err) {
-        statusEl.textContent = "Error loading model: " + err.message;
+        statusEl.textContent = "Error loading model: " + (err?.message || String(err));
       }
     }
 
@@ -131,10 +133,9 @@
 
       const inputTensor = new ort.Tensor("float32", dense, [1, vocabData.num_features]);
       const outputs = await session.run({ float_input: inputTensor });
-      const probs = outputs[session.outputNames[1]].data;
+      const spamProb = outputs.prob_spam.data[0];
       const latencyMs = (performance.now() - t0).toFixed(2);
 
-      const spamProb = probs[1];
       const isSpam = spamProb >= 0.5;
 
       document.getElementById("resultCard").style.display = "block";
